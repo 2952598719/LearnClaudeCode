@@ -19,11 +19,13 @@ client = Anthropic(base_url=os.getenv('ANTHROPIC_BASE_URL'))
 # System prompt & 工具列表
 # ==============================================================================
 SYSTEM = f"""
-You are a coding agent at {WORKDIR}.
-Act first, then report clearly.
+You are a coding agent at {WORKDIR}. Use tools to solve tasks.
 """.strip()
 TOOLS = [
     TOOL_PARAMS['bash'],
+    TOOL_PARAMS['read_file'],
+    TOOL_PARAMS['write_file'],
+    TOOL_PARAMS['edit_file']
 ]
 
 # ==============================================================================
