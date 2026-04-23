@@ -1,15 +1,13 @@
-
-
 import subprocess
 from pathlib import Path
 
 from anthropic.types import ToolParam
 from anthropic.types.tool_param import InputSchemaTyped
 
-MAX_BASH_OUTPUT = 50000
+# python不支持循环依赖，所以不要from agent import WORKDIR, THRESHOLD
 WORKDIR = Path.cwd()
-
-
+BASH_OUTPUT_THRESHOLD = 50000
+READ_LINES_THRESHOLD = 50000
 # ==============================================================================
 # 调用函数
 # ==============================================================================
@@ -18,8 +16,6 @@ def safe_path(p: str) -> Path:
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f'Path escapes workspace: {p}')
     return path
-
-
 
 # ==============================================================================
 # 基础工具
@@ -38,7 +34,7 @@ def run_bash(command: str) -> str:
             timeout=120
         )
         out = (r.stdout + r.stderr).strip()
-        return out[:MAX_BASH_OUTPUT] if out else '(no output)'
+        return out[:BASH_OUTPUT_THRESHOLD] if out else '(no output)'
     except subprocess.TimeoutExpired:
         return 'Error: Timeout (120s)'
     except (FileNotFoundError, OSError) as e:
@@ -46,11 +42,10 @@ def run_bash(command: str) -> str:
 
 def run_read(path: str, limit: int = None) -> str:
     try:
-        text = safe_path(path).read_text()
-        lines = text.splitlines()
+        lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f'...({len(lines) - limit} more lines)']
-        return '\n'.join(lines)[:MAX_BASH_OUTPUT]
+        return '\n'.join(lines)[:READ_LINES_THRESHOLD]
     except Exception as e:
         return f'Error: {e}'
 
@@ -82,6 +77,7 @@ TOOL_HANDLERS: dict = {
     'read_file':  lambda **kw: run_read(kw['path'], kw.get('limit')),
     'write_file': lambda **kw: run_write(kw['path'], kw['content']),
     'edit_file':  lambda **kw: run_edit(kw['path'], kw['old_text'], kw['new_text']),
+    'compact':    lambda **kw: "Manual compression requested.",
 }
 TOOL_PARAMS: dict[str, ToolParam] = {
     'bash': ToolParam(
@@ -124,6 +120,14 @@ TOOL_PARAMS: dict[str, ToolParam] = {
             required=['path', 'old_text', 'new_text'],
         ),
     ),
+    'compact': ToolParam(
+        name='compact',
+        description='Trigger manual conversation compression.',
+        input_schema=InputSchemaTyped(
+            type='object',
+            properties={'focus': {'type': 'string', 'description': 'What to preserve in the summary'}}
+        )
+    )
 }
 
 
