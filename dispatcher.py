@@ -69,20 +69,70 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
     except Exception as e:
         return f'Error: {e}'
 
+def run_compact():
+    return 'Manual compression requested.'
+
+# ==============================================================================
+# 待办工具
+# ==============================================================================
+class TodoManager:
+    VALID_STATUSES = ('pending', 'in_progress', 'completed')
+    STATUS_MARKERS = {'pending': '[ ]', 'in_progress': '[>]', 'completed': '[x]'}
+
+    def __init__(self):
+        self.items: list[dict] = []
+
+    def update(self, items: list) -> str:
+        if len(items) > 20:
+            raise ValueError('Max 20 todos allowed')
+
+        validated = []
+        in_progress_count = 0
+        for i, item in enumerate(items):
+            item_id = str(item.get('id', i + 1))
+            text = str(item.get('text', '')).strip()
+            status = str(item.get('status', 'pending')).lower()
+            if not text:
+                raise ValueError(f'Item {item_id}: text required')
+            if status not in self.VALID_STATUSES:
+                raise ValueError(f'Item {item_id}: invalid status {status!r}')
+            if status == 'in_progress':
+                in_progress_count += 1
+            validated.append({'id': item_id, 'text': text, 'status': status})
+
+        if in_progress_count > 1:
+            raise ValueError('Only one task can be in_progress at a time')
+
+        self.items = validated
+        return self.render()
+
+    def render(self) -> str:
+        if not self.items:
+            return 'No todos.'
+        lines = [
+            f"{self.STATUS_MARKERS[t['status']]} #{t['id']}: {t['text']}"
+            for t in self.items
+        ]
+        done = sum(1 for t in self.items if t['status'] == 'completed')
+        lines.append(f'\n({done}/{len(self.items)} completed)')
+        return '\n'.join(lines)
+
 # ==============================================================================
 # 工具注册表
 # ==============================================================================
+TODO = TodoManager()
 TOOL_HANDLERS: dict = {
     'bash':       lambda **kw: run_bash(kw['command']),
     'read_file':  lambda **kw: run_read(kw['path'], kw.get('limit')),
     'write_file': lambda **kw: run_write(kw['path'], kw['content']),
     'edit_file':  lambda **kw: run_edit(kw['path'], kw['old_text'], kw['new_text']),
-    'compact':    lambda **kw: "Manual compression requested.",
+    'compact':    lambda **kw: run_compact(),
+    'todo':       lambda **kw: TODO.update(kw['items']),
 }
 TOOL_PARAMS: dict[str, ToolParam] = {
     'bash': ToolParam(
         name='bash',
-        description='Run a shell command in the current workspace.',
+        description='Run a shell command.',
         input_schema=InputSchemaTyped(
             type='object',
             properties={'command': {'type': 'string'}},
@@ -127,7 +177,29 @@ TOOL_PARAMS: dict[str, ToolParam] = {
             type='object',
             properties={'focus': {'type': 'string', 'description': 'What to preserve in the summary'}}
         )
-    )
+    ),
+    'todo': ToolParam(
+        name='todo',
+        description='Update task list. Track progress on multi-step tasks.',
+        input_schema=InputSchemaTyped(
+            type='object',
+            properties={
+                'items': {
+                    'type': 'array',
+                    'items': {
+                        'type': 'object',
+                        'properties': {
+                            'id':     {'type': 'string'},
+                            'text':   {'type': 'string'},
+                            'status': {'type': 'string', 'enum': ['pending', 'in_progress', 'completed']},
+                        },
+                        'required': ['id', 'text', 'status'],
+                    },
+                },
+            },
+            required=['items'],
+        ),
+    ),
 }
 
 

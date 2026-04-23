@@ -26,16 +26,20 @@ COMPACT_RESULT_MAX_LEN = 2000
 TRANSCRIPT_DIR = WORKDIR / '.transcripts'
 KEEP_RECENT = 3
 PRESERVE_RESULT_TOOLS = {'read_file'}
+# 提示参数
+NAG_INTERVAL = 3         # 超过此轮数未调用待办更新则提醒模型
 # --- System prompt & 工具列表 ---
 SYSTEM = f"""
-You are a coding agent at {WORKDIR}. Use tools to solve tasks.
+你是一个编程agent，位于{WORKDIR}，使用提供的工具去解决任务。
+使用todo工具规划多步骤任务。启动前和完成后分别标记。
 """.strip()
 TOOLS = [
     TOOL_PARAMS['bash'],
     TOOL_PARAMS['read_file'],
     TOOL_PARAMS['write_file'],
     TOOL_PARAMS['edit_file'],
-    TOOL_PARAMS['compact']
+    TOOL_PARAMS['compact'],
+    TOOL_PARAMS['todo']
 ]
 
 # ==============================================================================
@@ -133,23 +137,19 @@ def _process_tool(block):
 def _process_text(block):
     print(f'\033[32m【agent】\033[0m{block.text}')
 
-def _process_compact(block):
-    print(f'\033[32m【agent】\033[0m\033[33m{block.name}\033[0m')
-    print('Compressing...')
-    return 'Compressing...'
-
 # ==============================================================================
 # 主 Agent 循环
 # ==============================================================================
 def agent_loop(messages: list):
+    rounds_since_todo = 0
     while True:
         # --- 将消息上下文进行压缩 ---
         micro_compact(messages)
         if estimate_tokens(messages) > COMPACT_THRESHOLD_LEN:
             print('[auto compact triggered]')
-            success, new_messages = auto_compact(messages)    # 深替换，不能去掉[:]
+            success, new_messages = auto_compact(messages)
             if success:
-                messages[:] = new_messages
+                messages[:] = new_messages  # 深替换，不能去掉[:]
         # --- 获取模型响应，主体是一系列block ---
         response = client.messages.create(
             model=MODEL,
@@ -160,31 +160,33 @@ def agent_loop(messages: list):
         )
         messages.append({'role': 'assistant', 'content': response.content})
         # --- 处理block ---
-        # 模型返回格式：(1)TextBlock (2) TextBlock + ToolBlock × (1~n)
-        results = []
-        manual_compact = False
-        for block in response.content:
-            if block.type == 'text':
-                _process_text(block)
-            elif block.type == 'tool_use':
-                if block.name == 'compact':
-                    manual_compact = True
-                    output = _process_compact(block)
-                else:
+        if response.stop_reason == 'tool_use':  # response.stop_reason = tool_use时，content = TextBlock × 0-1 + ToolBlock × 1-n
+            manual_compact = False
+            using_todo = False
+            results = []
+            for block in response.content:
+                if block.type == 'tool_use':
+                    if block.name == 'compact': manual_compact = True
+                    elif block.name == 'todo': using_todo = True
                     output = _process_tool(block)
-                results.append({'type': 'tool_result', 'tool_use_id': block.id, 'content': str(output)})
-        if len(results) != 0:
+                    results.append({'type': 'tool_result', 'tool_use_id': block.id, 'content': str(output)})
+                elif block.type == 'text':
+                    _process_text(block)
+            # --- 未更新待办时的提醒 ---
+            rounds_since_todo = 0 if using_todo else rounds_since_todo + 1
+            if rounds_since_todo >= NAG_INTERVAL:
+                results.append({'type': 'text', 'text': '<reminder>如果已有todo列表，请更新列表</reminder>'})
             messages.append({'role': 'user', 'content': results})
-
-        # --- 收尾 ---
-        if manual_compact:
-            print('[manual compact]')
-            success, new_messages = auto_compact(messages)
-            if success:
-                messages[:] = new_messages
-        if response.stop_reason != 'tool_use':  # 也就是end_turn，表明模型完成任务
-            return
-
+            # --- 执行压缩 ---
+            if manual_compact:
+                print('[manual compact triggered]')
+                success, new_messages = auto_compact(messages)
+                if success:
+                    messages[:] = new_messages
+        elif response.stop_reason == 'end_turn':      # response.stop_reason = end_turn时，content = TextBlock × 1
+            block = response.content[0]
+            _process_text(block)
+            break
 
 if __name__ == '__main__':
     history: list = []
