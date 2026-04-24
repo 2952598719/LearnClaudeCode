@@ -273,7 +273,7 @@ TOOL_HANDLERS: dict = {
     'task_update':  lambda **kw: TASKS.update(kw['task_id'], kw.get('status'), kw.get('addBlockedBy'), kw.get('removeBlockedBy')),
     'task_list':    lambda **kw: TASKS.list_all(),
     'task_get':     lambda **kw: TASKS.get(kw['task_id']),
-    # 指令-异步执行
+    # 任务-指令异步执行
     'background_run':   lambda **kw: BG.run(kw['command']),
     'check_background': lambda **kw: BG.check(kw.get('task_id'))
 }
@@ -413,8 +413,19 @@ TOOL_PARAMS: dict[str, ToolParam] = {
             type='object',
             properties={'task_id': {'type': 'string'}}
         )
+    ),
+    'subtask': ToolParam(
+        name='subtask',
+        description='Spawn a subagent with fresh context. It shares the filesystem but not conversation history.',
+        input_schema=InputSchemaTyped(
+            type='object',
+            properties={
+                'prompt': {'type': 'string'},
+                'description': {'type': 'string', 'description': 'Short description of the task'}
+            },
+            required=['prompt']
+        )
     )
-
 
 
 

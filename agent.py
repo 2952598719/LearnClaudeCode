@@ -23,10 +23,10 @@ COMPACT_THRESHOLD_LEN = 50000
 COMPACT_TRUNCATE_LEN = 80000
 COMPACT_RESULT_MAX_LEN = 2000
 TRANSCRIPT_DIR = WORKDIR / '.transcripts'
-KEEP_RECENT = 3
+KEEP_RECENT = 5
 PRESERVE_RESULT_TOOLS = {'read_file'}
-# 提示参数
-NAG_INTERVAL = 3         # 超过此轮数未调用待办更新则提醒模型
+# 子agent参数
+SUBAGENT_MAX_TURN = 30
 # --- System prompt & 工具列表 ---
 SYSTEM = f"""
 你是一个位于{WORKDIR}的编程agent，使用提供的工具去解决任务。
@@ -46,9 +46,18 @@ TOOLS = [
     TOOL_PARAMS['task_get'],
     # 指令-异步执行
     TOOL_PARAMS['background_run'],
-    TOOL_PARAMS['check_background']
+    TOOL_PARAMS['check_background'],
+    # 子agent
+    TOOL_PARAMS['subtask']
 ]
-
+SUBAGNET_SYSTEM = (f'你是一个位于{WORKDIR}的编程子agent。'
+                   f'完成你的任务，然后总结你的发现。')
+SUBAGENT_TOOLS = [
+    TOOL_PARAMS['bash'],
+    TOOL_PARAMS['read_file'],
+    TOOL_PARAMS['write_file'],
+    TOOL_PARAMS['edit_file'],
+]
 # ==============================================================================
 # 压缩函数
 # ==============================================================================
@@ -128,25 +137,66 @@ def auto_compact(messages: list) -> tuple[bool, list]:
 # ==============================================================================
 # block处理
 # ==============================================================================
-def _process_tool(block):
-    # --- 获取工具 ---
-    print(f'\033[32m【agent】\033[0m\033[33m{block.name}: {block.input}\033[0m')
-    handler = TOOL_HANDLERS.get(block.name)
-    # --- 执行输出 ---
-    try:
-        output = handler(**block.input) if handler else f'Unknown tool: {block.name}'
-    except Exception as e:
-        output = f'Error: {e}'
+def _process_tool(block, use_subagent, is_subagent):
+    if use_subagent:
+        desc = block.input.get('description', 'subtask')
+        prompt = block.input.get('prompt', '')
+        print(f'\033[32m【agent】\033[0m\033[33m subtask: {desc} {block.input}\033[0m')
+        output = subagent_loop(prompt)
+    else:
+        # --- 获取工具 ---
+        if is_subagent:
+            print(f'\033[34m【subagent】\033[0m\033[33m{block.name}: {block.input}\033[0m')
+        else:
+            print(f'\033[32m【agent】\033[0m\033[33m{block.name}: {block.input}\033[0m')
+        handler = TOOL_HANDLERS.get(block.name)
+        # --- 执行输出 ---
+        try:
+            output = handler(**block.input) if handler else f'Unknown tool: {block.name}'
+        except Exception as e:
+            output = f'Error: {e}'
     print(output if len(output) <= 200 else f'{output[:200]}... ({len(output) - 200} chars left)')
     print('-' * 64)
     return output
 
-def _process_text(block):
-    print(f'\033[32m【agent】\033[0m{block.text}')
+def _process_text(block, is_subagent):
+    if is_subagent:
+        print(f'\033[34m【subagent】\033[0m{block.text}')
+    else:
+        print(f'\033[32m【agent】\033[0m{block.text}')
 
 # ==============================================================================
 # 主 Agent 循环
 # ==============================================================================
+def subagent_loop(prompt: str) -> str:
+    sub_messages = [
+        MessageParam(role='user', content=prompt)
+    ]
+    response = None
+    for _ in range(SUBAGENT_MAX_TURN):
+        response = client.messages.create(
+            model=MODEL,
+            system=SUBAGNET_SYSTEM,
+            messages=sub_messages,
+            tools=SUBAGENT_TOOLS,
+            max_tokens=RESPONSE_MAX_LEN
+        )
+        sub_messages.append(MessageParam(role='assistant', content=response.content))
+        if response.stop_reason == 'tool_use':  # response.stop_reason = tool_use时，content = TextBlock × 0-1 + ToolBlock × 1-n
+            results = []
+            for block in response.content:
+                if block.type == 'tool_use':
+                    output = _process_tool(block, False, True)
+                    results.append({'type': 'tool_result', 'tool_use_id': block.id, 'content': str(output)})
+                elif block.type == 'text':
+                    _process_text(block, True)
+            sub_messages.append({'role': 'user', 'content': results})
+        elif response.stop_reason == 'end_turn':      # response.stop_reason = end_turn时，content = TextBlock × 1
+            # block = response.content[0]
+            # _process_text(block, True)
+            break
+    return ''.join(b.text for b in response.content if hasattr(b, 'text')) or '(no summary)'
+
 def agent_loop(messages: list):
     while True:
         # --- 将消息上下文进行压缩 ---
@@ -182,10 +232,10 @@ def agent_loop(messages: list):
             for block in response.content:
                 if block.type == 'tool_use':
                     if block.name == 'compact': manual_compact = True
-                    output = _process_tool(block)
+                    output = _process_tool(block, block.name == 'subtask', False)
                     results.append({'type': 'tool_result', 'tool_use_id': block.id, 'content': str(output)})
                 elif block.type == 'text':
-                    _process_text(block)
+                    _process_text(block, False)
             messages.append({'role': 'user', 'content': results})
             # --- 执行压缩 ---
             if manual_compact:
@@ -195,7 +245,7 @@ def agent_loop(messages: list):
                     messages[:] = new_messages
         elif response.stop_reason == 'end_turn':      # response.stop_reason = end_turn时，content = TextBlock × 1
             block = response.content[0]
-            _process_text(block)
+            _process_text(block, False)
             break
 
 if __name__ == '__main__':
