@@ -1,3 +1,4 @@
+import json
 import subprocess
 from pathlib import Path
 
@@ -6,6 +7,7 @@ from anthropic.types.tool_param import InputSchemaTyped
 
 # python不支持循环依赖，所以不要from agent import WORKDIR, THRESHOLD
 WORKDIR = Path.cwd()
+TASKS_DIR = WORKDIR / '.tasks'
 BASH_OUTPUT_THRESHOLD = 50000
 READ_LINES_THRESHOLD = 50000
 # ==============================================================================
@@ -73,8 +75,9 @@ def run_compact():
     return 'Manual compression requested.'
 
 # ==============================================================================
-# 待办工具
+# 任务工具
 # ==============================================================================
+# --- 基础待办 ---
 class TodoManager:
     VALID_STATUSES = ('pending', 'in_progress', 'completed')
     STATUS_MARKERS = {'pending': '[ ]', 'in_progress': '[>]', 'completed': '[x]'}
@@ -117,17 +120,106 @@ class TodoManager:
         lines.append(f'\n({done}/{len(self.items)} completed)')
         return '\n'.join(lines)
 
+class TaskManager:
+    VALID_STATUSES = ('pending', 'in_progress', 'completed')
+    STATUS_MARKERS = {'pending': '[ ]', 'in_progress': '[>]', 'completed': '[x]'}
+
+    def __init__(self, tasks_dir: Path):
+        tasks_dir.mkdir(exist_ok=True)
+        self.dir = tasks_dir
+        self._next_id = self._max_id() + 1
+
+    def _max_id(self) -> int:
+        ids = [int(f.stem.split('_')[1]) for f in self.dir.glob('task_*.json')]
+        return max(ids) if ids else 0
+
+    def _load(self, task_id: int) -> dict:
+        path = self.dir / f'task_{task_id}.json'
+        if not path.exists():
+            raise ValueError(f'Task {task_id} not found')
+        return json.loads(path.read_text())
+
+    def _save(self, task: dict):
+        path = self.dir / f"task_{task['id']}.json"
+        path.write_text(json.dumps(task, indent=2, ensure_ascii=False))
+
+    def _clear_dependency(self, completed_id: int):
+        # 这里看上去就是那种最值得优化的地方，存个后续节点就不用遍历了，但是作者没优化是有原因的
+        # 首先任务数量不会太多，而且大部分情况下只需要查当前任务的前驱即可
+        # 其次现在只有在任务完成时遍历，如果存后续的话，每次update时就要遍历来更新其他节点的前驱了，出错概率猛增
+        for f in self.dir.glob('task_*.json'):
+            task = json.loads(f.read_text())
+            if completed_id in task.get('blockedBy', []):
+                task['blockedBy'].remove(completed_id)
+                self._save(task)
+
+    def create(self, subject: str, description: str='') -> str:
+        task = {
+            'id': self._next_id,
+            'subject': subject,
+            'description': description,
+            'status': 'pending',
+            'blockedBy': [],
+            'owner': '',
+        }
+        self._save(task)
+        self._next_id += 1
+        return json.dumps(task, indent=2, ensure_ascii=False)
+
+    def get(self, task_id: int) -> str:
+        return json.dumps(self._load(task_id), indent=2, ensure_ascii=False)
+
+    def update(self, task_id: int, status: str = None, add_blocked_by: list = None, remove_blocked_by: list = None) -> str:
+        task = self._load(task_id)
+        if status:  # 如果status不为None
+            if status not in self.VALID_STATUSES:
+                raise ValueError(f'Invalid status: {status}')
+            task['status'] = status
+            if status == 'completed':
+                self._clear_dependency(task_id)
+        if add_blocked_by:
+            task['blockedBy'] = list(set(task['blockedBy'] + add_blocked_by))
+        if remove_blocked_by:
+            task['blockedBy'] = [x for x in task['blockedBy'] if x not in remove_blocked_by]
+        self._save(task)
+        return json.dumps(task, indent=2, ensure_ascii=False)
+
+    def list_all(self) -> str:
+        tasks = []
+        files = sorted(
+            self.dir.glob('task_*.json'),
+            key=lambda f: int(f.stem.split('_')[1])
+        )
+        for f in files:
+            tasks.append(json.loads(f.read_text()))
+        if not tasks:
+            return 'No tasks.'
+        lines = []
+        for t in tasks:
+            marker = self.STATUS_MARKERS.get(t['status'], '[?]')
+            blocked = f"(blocked by: {t['blockedBy']})" if t.get('blockedBy') else ''
+            lines.append(f"{marker} #{t['id']}: {t['subject']}{blocked}")
+        return '\n'.join(lines)
+
+
+
+
 # ==============================================================================
 # 工具注册表
 # ==============================================================================
 TODO = TodoManager()
+TASKS = TaskManager(TASKS_DIR)
 TOOL_HANDLERS: dict = {
-    'bash':       lambda **kw: run_bash(kw['command']),
-    'read_file':  lambda **kw: run_read(kw['path'], kw.get('limit')),
-    'write_file': lambda **kw: run_write(kw['path'], kw['content']),
-    'edit_file':  lambda **kw: run_edit(kw['path'], kw['old_text'], kw['new_text']),
-    'compact':    lambda **kw: run_compact(),
-    'todo':       lambda **kw: TODO.update(kw['items']),
+    'bash':         lambda **kw: run_bash(kw['command']),
+    'read_file':    lambda **kw: run_read(kw['path'], kw.get('limit')),
+    'write_file':   lambda **kw: run_write(kw['path'], kw['content']),
+    'edit_file':    lambda **kw: run_edit(kw['path'], kw['old_text'], kw['new_text']),
+    'compact':      lambda **kw: run_compact(),
+    'todo':         lambda **kw: TODO.update(kw['items']),
+    'task_create':  lambda **kw: TASKS.create(kw['subject'], kw.get('description')),
+    'task_update':  lambda **kw: TASKS.update(kw['task_id'], kw.get('status'), kw.get('addBlockedBy'), kw.get('removeBlockedBy')),
+    'task_list':    lambda **kw: TASKS.list_all(),
+    'task_get':     lambda **kw: TASKS.get(kw['task_id'])
 }
 TOOL_PARAMS: dict[str, ToolParam] = {
     'bash': ToolParam(
@@ -200,6 +292,60 @@ TOOL_PARAMS: dict[str, ToolParam] = {
             required=['items'],
         ),
     ),
+    'task_create': ToolParam(
+        name='task_create',
+        description='Create a new task.',
+        input_schema=InputSchemaTyped(
+            type='object',
+            properties={
+                'subject': {'type': 'string'},
+                'description': {'type': 'string'},
+            },
+            required=['subject']
+        )
+    ),
+    'task_update': ToolParam(
+        name='task_update',
+        description='Update status or dependencies of a task.',
+        input_schema=InputSchemaTyped(
+            type='object',
+            properties={
+                'task_id': {'type': 'integer'},
+                'status': {'type': 'string', 'enum': ['pending', 'in_progress', 'completed']},
+                'addBlockedBy': {
+                    'type': 'array',
+                    'items': {'type': 'integer'}
+                },
+                'removeBlockedBy': {
+                    'type': 'array',
+                    'items': {'type': 'integer'}
+                },
+            },
+            required=['task_id']
+        )
+    ),
+    'task_list': ToolParam(
+        name='task_list',
+        description='List all tasks with status summary.',
+        input_schema=InputSchemaTyped(
+            type='object',
+            properties={}
+        )
+    ),
+    'task_get': ToolParam(
+        name='task_get',
+        description='Get full details of a task by ID.',
+        input_schema=InputSchemaTyped(
+            type='object',
+            properties={'task_id': {'type': 'string'}},
+            required=['task_id']
+        )
+    )
+
+
+
+
+
 }
 
 

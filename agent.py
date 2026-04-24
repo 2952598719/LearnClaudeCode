@@ -31,7 +31,7 @@ NAG_INTERVAL = 3         # 超过此轮数未调用待办更新则提醒模型
 # --- System prompt & 工具列表 ---
 SYSTEM = f"""
 你是一个编程agent，位于{WORKDIR}，使用提供的工具去解决任务。
-使用todo工具规划多步骤任务。启动前和完成后分别标记。
+使用task相关工具来计划和追踪任务。
 """.strip()
 TOOLS = [
     TOOL_PARAMS['bash'],
@@ -39,7 +39,10 @@ TOOLS = [
     TOOL_PARAMS['write_file'],
     TOOL_PARAMS['edit_file'],
     TOOL_PARAMS['compact'],
-    TOOL_PARAMS['todo']
+    TOOL_PARAMS['task_create'],
+    TOOL_PARAMS['task_update'],
+    TOOL_PARAMS['task_list'],
+    TOOL_PARAMS['task_get'],
 ]
 
 # ==============================================================================
@@ -141,7 +144,6 @@ def _process_text(block):
 # 主 Agent 循环
 # ==============================================================================
 def agent_loop(messages: list):
-    rounds_since_todo = 0
     while True:
         # --- 将消息上下文进行压缩 ---
         micro_compact(messages)
@@ -162,20 +164,14 @@ def agent_loop(messages: list):
         # --- 处理block ---
         if response.stop_reason == 'tool_use':  # response.stop_reason = tool_use时，content = TextBlock × 0-1 + ToolBlock × 1-n
             manual_compact = False
-            using_todo = False
             results = []
             for block in response.content:
                 if block.type == 'tool_use':
                     if block.name == 'compact': manual_compact = True
-                    elif block.name == 'todo': using_todo = True
                     output = _process_tool(block)
                     results.append({'type': 'tool_result', 'tool_use_id': block.id, 'content': str(output)})
                 elif block.type == 'text':
                     _process_text(block)
-            # --- 未更新待办时的提醒 ---
-            rounds_since_todo = 0 if using_todo else rounds_since_todo + 1
-            if rounds_since_todo >= NAG_INTERVAL:
-                results.append({'type': 'text', 'text': '<reminder>如果已有todo列表，请更新列表</reminder>'})
             messages.append({'role': 'user', 'content': results})
             # --- 执行压缩 ---
             if manual_compact:
