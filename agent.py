@@ -7,8 +7,7 @@ from anthropic import Anthropic
 from anthropic.types import MessageParam
 from dotenv import load_dotenv
 
-from dispatcher import TOOL_PARAMS, TOOL_HANDLERS
-
+from dispatcher import TOOL_PARAMS, TOOL_HANDLERS, BG
 
 # ==============================================================================
 # 配置
@@ -30,8 +29,9 @@ PRESERVE_RESULT_TOOLS = {'read_file'}
 NAG_INTERVAL = 3         # 超过此轮数未调用待办更新则提醒模型
 # --- System prompt & 工具列表 ---
 SYSTEM = f"""
-你是一个编程agent，位于{WORKDIR}，使用提供的工具去解决任务。
+你是一个位于{WORKDIR}的编程agent，使用提供的工具去解决任务。
 使用task相关工具来计划和追踪任务。
+使用background工具来运行需要长时间的命令。
 """.strip()
 TOOLS = [
     TOOL_PARAMS['bash'],
@@ -39,10 +39,14 @@ TOOLS = [
     TOOL_PARAMS['write_file'],
     TOOL_PARAMS['edit_file'],
     TOOL_PARAMS['compact'],
+    # 任务-持久化
     TOOL_PARAMS['task_create'],
     TOOL_PARAMS['task_update'],
     TOOL_PARAMS['task_list'],
     TOOL_PARAMS['task_get'],
+    # 指令-异步执行
+    TOOL_PARAMS['background_run'],
+    TOOL_PARAMS['check_background']
 ]
 
 # ==============================================================================
@@ -152,6 +156,16 @@ def agent_loop(messages: list):
             success, new_messages = auto_compact(messages)
             if success:
                 messages[:] = new_messages  # 深替换，不能去掉[:]
+        # 将后台任务结果注入对话，让LLM感知
+        notifs = BG.drain_notifications()
+        if notifs and messages:
+            notifs_text = '\n'.join(
+                f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs
+            )
+            messages.append({
+                'role': 'user',
+                'content': f'<background-results>\n{notifs_text}\n</background-result>'
+            })
         # --- 获取模型响应，主体是一系列block ---
         response = client.messages.create(
             model=MODEL,

@@ -1,5 +1,7 @@
 import json
 import subprocess
+import threading
+import uuid
 from pathlib import Path
 
 from anthropic.types import ToolParam
@@ -127,7 +129,7 @@ class TaskManager:
     def __init__(self, tasks_dir: Path):
         tasks_dir.mkdir(exist_ok=True)
         self.dir = tasks_dir
-        self._next_id = self._max_id() + 1
+        self._next_id = self._max_id() + 1  # 对于持久化到硬盘上的文件，应该每次启动都能读到
 
     def _max_id(self) -> int:
         ids = [int(f.stem.split('_')[1]) for f in self.dir.glob('task_*.json')]
@@ -201,25 +203,79 @@ class TaskManager:
             lines.append(f"{marker} #{t['id']}: {t['subject']}{blocked}")
         return '\n'.join(lines)
 
+class BackgroundManager:
+    def __init__(self):
+        self.tasks = {}
+        self._notification_queue = []
+        self._lock = threading.Lock()   # 创建互斥锁，with自动加锁解锁
 
+    def run(self, command):
+        task_id = str(uuid.uuid4())[:8]
+        self.tasks[task_id] = {'status': 'running', 'result': None, 'command': command}
+        threading.Thread(target=self._execute, args=(task_id, command), daemon=True).start()    # daemon=True构建守护线程异步执行任务
+        return f'Background task {task_id} started: {command[:80]}'
 
+    def _execute(self, task_id, command):
+        try:
+            r = subprocess.run(
+                command,
+                shell=True,
+                cwd=WORKDIR,
+                capture_output=True,
+                text=True,
+                timeout=300
+            )
+            output = (r.stdout + r.stderr).strip()[:50000]
+            status = 'completed'
+        except subprocess.TimeoutExpired:
+            output, status = 'Error: Timeout (300s)', 'timeout'
+        except Exception as e:
+            output, status = f'Error: {e}', 'error'
+        self.tasks[task_id].update(status=status, result=output or '(no output)')
+        with self._lock:
+            self._notification_queue.append({
+                'task_id': task_id,
+                'status': status,
+                'command': command[:80],
+                'result': (output or '(no output)')[:500]
+            })
+
+    def check(self, task_id=None):
+        if task_id:     # 传入task_id就是检查这个任务的内容
+            t = self.tasks.get(task_id)
+            return f"[{t['status']}] {t['command'][:60]}\n{t.get('result') or '(running)'}" if t else \
+                f'Error: Unknown task{task_id}'
+        else:           # 没有传入task_id就是检查所有任务内容
+            lines = [f"{tid}: [{t['status']}]" for tid, t in self.tasks.items()]
+            return '\n'.join(lines) if lines else 'No background tasks'
+
+    def drain_notifications(self):
+        with self._lock:
+            notifs, self._notification_queue = list(self._notification_queue), []
+        return notifs
 
 # ==============================================================================
 # 工具注册表
 # ==============================================================================
 TODO = TodoManager()
 TASKS = TaskManager(TASKS_DIR)
+BG = BackgroundManager()
 TOOL_HANDLERS: dict = {
     'bash':         lambda **kw: run_bash(kw['command']),
     'read_file':    lambda **kw: run_read(kw['path'], kw.get('limit')),
     'write_file':   lambda **kw: run_write(kw['path'], kw['content']),
     'edit_file':    lambda **kw: run_edit(kw['path'], kw['old_text'], kw['new_text']),
     'compact':      lambda **kw: run_compact(),
+    # 任务-基础版
     'todo':         lambda **kw: TODO.update(kw['items']),
+    # 任务-持久化
     'task_create':  lambda **kw: TASKS.create(kw['subject'], kw.get('description')),
     'task_update':  lambda **kw: TASKS.update(kw['task_id'], kw.get('status'), kw.get('addBlockedBy'), kw.get('removeBlockedBy')),
     'task_list':    lambda **kw: TASKS.list_all(),
-    'task_get':     lambda **kw: TASKS.get(kw['task_id'])
+    'task_get':     lambda **kw: TASKS.get(kw['task_id']),
+    # 指令-异步执行
+    'background_run':   lambda **kw: BG.run(kw['command']),
+    'check_background': lambda **kw: BG.check(kw.get('task_id'))
 }
 TOOL_PARAMS: dict[str, ToolParam] = {
     'bash': ToolParam(
@@ -340,8 +396,24 @@ TOOL_PARAMS: dict[str, ToolParam] = {
             properties={'task_id': {'type': 'string'}},
             required=['task_id']
         )
+    ),
+    'background_run': ToolParam(
+        name='background_run',
+        description='Run command in background thread. Returns task_id immediately.',
+        input_schema=InputSchemaTyped(
+            type='object',
+            properties={'command': {'type': 'string'}},
+            required=['command']
+        )
+    ),
+    'check_background': ToolParam(
+        name='check_background',
+        description='Check background task status. Omit task_id to list all.',
+        input_schema=InputSchemaTyped(
+            type='object',
+            properties={'task_id': {'type': 'string'}}
+        )
     )
-
 
 
 
